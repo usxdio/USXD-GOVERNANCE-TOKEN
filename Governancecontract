@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract USXDShare is ERC20, ReentrancyGuard, Ownable {
+    // Total Supply Constants
+    uint256 public constant TOTAL_SUPPLY = 1000 * 1e18; // 1000 tokens
+    uint256 public constant DEPLOYER_ALLOCATION = 500 * 1e18; // 500 tokens (50%)
+    uint256 public constant PHASE1_ALLOCATION = 200 * 1e18; // 200 tokens (20%)
+    uint256 public constant PHASE2_ALLOCATION = 300 * 1e18; // 300 tokens (30%)
+
+    // Investment phases
+    enum Phase { PHASE_1, PHASE_2, CLOSED }
+    Phase public currentPhase;
+    
+    // Investment thresholds (in ETH)
+    uint256 public constant PHASE1_CAP = 150 ether;    // 150 ETH
+    uint256 public constant PHASE2_CAP = 225 ether;    // 225 ETH
+    uint256 public constant VOTING_RIGHTS_THRESHOLD = 7.5 ether;  // 7.5 ETH = 1% voting power
+
+    // Tracking
+    mapping(address => uint256) public investments;
+    uint256 public totalInvested;
+    mapping(address => uint256) public votingPower;
+
+    // Community Pool Structure
+    struct CommunityPool {
+        string name;
+        address[] members;
+        bool isActive;
+        uint256 votingPower;
+    }
+
+    struct CommunityVote {
+        uint256 proposalId;
+        uint256 votesInFavor;
+        uint256 votesAgainst;
+        mapping(address => bool) hasVoted;
+        bool executed;
+        uint256 deadline;
+    }
+    
+    // Community Pool Mappings
+    mapping(bytes32 => CommunityPool) public communityPools;
+    mapping(address => bytes32) public walletToCommunity;
+    mapping(bytes32 => mapping(uint256 => CommunityVote)) public communityVotes;
+    uint256 public nextProposalId = 1;
+    
+    // Events
+    event InvestmentMade(address investor, uint256 amount, uint256 tokensReceived);
+    event VotingRightsGranted(address investor, uint256 votingPower);
+    event PhaseChanged(Phase newPhase);
+    event CommunityPoolCreated(bytes32 poolId, string name, address[] members);
+    event CommunityVotingPowerUpdated(bytes32 poolId, uint256 newVotingPower);
+    event ProposalCreated(string poolName, uint256 proposalId, string description, uint256 deadline);
+    event VoteCast(string poolName, uint256 proposalId, address voter, bool support);
+    event ProposalExecuted(string poolName, uint256 proposalId, bool passed);
+
+    constructor(address initialOwner) 
+        ERC20("USXD Share", "USXD-SHARE")
+        Ownable(initialOwner) 
+    {
+        currentPhase = Phase.PHASE_1;
+        _mint(initialOwner, DEPLOYER_ALLOCATION); // Mint 50% to deployer
+    }
+
+    function invest() external payable nonReentrant {
+        require(currentPhase != Phase.CLOSED, "Investment period closed");
+        require(msg.value > 0, "Must send ETH");
+        
+        uint256 tokensToMint;
+        if (currentPhase == Phase.PHASE_1) {
+            require(totalInvested + msg.value <= PHASE1_CAP, "Phase 1 cap reached");
+            tokensToMint = (msg.value * PHASE1_ALLOCATION) / PHASE1_CAP;
+        } else {
+            require(totalInvested + msg.value <= PHASE2_CAP, "Phase 2 cap reached");
+            tokensToMint = (msg.value * PHASE2_ALLOCATION) / PHASE2_CAP;
+        }
+        
+        investments[msg.sender] += msg.value;
+        totalInvested += msg.value;
+        
+        // Update individual voting power
+        if (investments[msg.sender] >= VOTING_RIGHTS_THRESHOLD) {
+            uint256 newVotingPower = investments[msg.sender] / VOTING_RIGHTS_THRESHOLD;
+            if (newVotingPower != votingPower[msg.sender]) {
+                votingPower[msg.sender] = newVotingPower;
+                emit VotingRightsGranted(msg.sender, newVotingPower);
+            }
+        }
+        
+        // Update community voting power if part of a community
+        bytes32 poolId = walletToCommunity[msg.sender];
+        if(poolId != bytes32(0)) {
+            updateCommunityVotingPower(poolId);
+        }
+        
+        _mint(msg.sender, tokensToMint);
+        emit InvestmentMade(msg.sender, msg.value, tokensToMint);
+        
+        if (currentPhase == Phase.PHASE_1 && totalInvested >= PHASE1_CAP) {
+            currentPhase = Phase.PHASE_2;
+            emit PhaseChanged(Phase.PHASE_2);
+        } else if (currentPhase == Phase.PHASE_2 && totalInvested >= PHASE1_CAP + PHASE2_CAP) {
+            currentPhase = Phase.CLOSED;
+            emit PhaseChanged(Phase.CLOSED);
+        }
+    }
+
+    // Community Pool Functions
+    function createCommunityPool(
+        string memory _name,
+        address[] memory _members
+    ) external {
+        bytes32 poolId = keccak256(abi.encodePacked(_name));
+        require(communityPools[poolId].isActive == false, "Pool already exists");
+        
+        for(uint i = 0; i < _members.length; i++) {
+            require(walletToCommunity[_members[i]] == bytes32(0), "Wallet already in pool");
+            walletToCommunity[_members[i]] = poolId;
+        }
+
+        communityPools[poolId] = CommunityPool({
+            name: _name,
+            members: _members,
+            isActive: true,
+            votingPower: 0
+        });
+
+        emit CommunityPoolCreated(poolId, _name, _members);
+        updateCommunityVotingPower(poolId);
+    }
+
+    function createCommunityProposal(
+        string memory poolName,
+        string memory description
+    ) external {
+        bytes32 poolId = keccak256(abi.encodePacked(poolName));
+        require(communityPools[poolId].isActive, "Pool doesn't exist");
+        
+        bool isMember = false;
+        for(uint i = 0; i < communityPools[poolId].members.length; i++) {
+            if(msg.sender == communityPools[poolId].members[i]) {
+                isMember = true;
+                break;
+            }
+        }
+        require(isMember, "Not a pool member");
+        
+        uint256 proposalId = nextProposalId++;
+        
+        CommunityVote storage newVote = communityVotes[poolId][proposalId];
+        newVote.proposalId = proposalId;
+        newVote.deadline = block.timestamp + 3 days;
+        
+        emit ProposalCreated(poolName, proposalId, description, newVote.deadline);
+    }
+
+    function voteCommunity(
+        string memory poolName,
+        uint256 proposalId,
+        bool support
+    ) external {
+        bytes32 poolId = keccak256(abi.encodePacked(poolName));
+        require(communityPools[poolId].isActive, "Pool doesn't exist");
+        
+        CommunityVote storage vote = communityVotes[poolId][proposalId];
+        require(block.timestamp < vote.deadline, "Voting period ended");
+        require(!vote.executed, "Proposal already executed");
+        
+        bool isMember = false;
+        for(uint i = 0; i < communityPools[poolId].members.length; i++) {
+            if(msg.sender == communityPools[poolId].members[i]) {
+                isMember = true;
+                break;
+            }
+        }
+        require(isMember, "Not a pool member");
+        
+        require(!vote.hasVoted[msg.sender], "Already voted");
+        
+        if(support) {
+            vote.votesInFavor++;
+        } else {
+            vote.votesAgainst++;
+        }
+        
+        vote.hasVoted[msg.sender] = true;
+        
+        emit VoteCast(poolName, proposalId, msg.sender, support);
+    }
+
+    function updateCommunityVotingPower(bytes32 poolId) public {
+        require(communityPools[poolId].isActive, "Pool doesn't exist");
+        
+        uint256 totalInvestment = 0;
+        address[] memory members = communityPools[poolId].members;
+        
+        for(uint i = 0; i < members.length; i++) {
+            totalInvestment += investments[members[i]];
+        }
+        
+        uint256 newVotingPower = totalInvestment / VOTING_RIGHTS_THRESHOLD;
+        
+        if(newVotingPower != communityPools[poolId].votingPower) {
+            communityPools[poolId].votingPower = newVotingPower;
+            emit CommunityVotingPowerUpdated(poolId, newVotingPower);
+        }
+    }
+
+    // Helper functions
+    function getVotingPower(address investor) external view returns (uint256) {
+        return votingPower[investor];
+    }
+    
+    function getCommunityVotingPower(string memory poolName) public view returns (uint256) {
+        bytes32 poolId = keccak256(abi.encodePacked(poolName));
+        require(communityPools[poolId].isActive, "Pool doesn't exist");
+        return communityPools[poolId].votingPower;
+    }
+
+    function getCommunityInvestment(string memory poolName) public view returns (uint256) {
+        bytes32 poolId = keccak256(abi.encodePacked(poolName));
+        require(communityPools[poolId].isActive, "Pool doesn't exist");
+        
+        uint256 total = 0;
+        address[] memory members = communityPools[poolId].members;
+        
+        for(uint i = 0; i < members.length; i++) {
+            total += investments[members[i]];
+        }
+        
+        return total;
+    }
+    
+    function withdrawFunds() external onlyOwner {
+        (bool success, ) = owner().call{value: address(this).balance}("");
+        require(success, "Transfer failed");
+    }
+
+    function setPhase(Phase _phase) external onlyOwner {
+        currentPhase = _phase;
+        emit PhaseChanged(_phase);
+    }
+    
+    function getCurrentPrice() public view returns (uint256) {
+        if (currentPhase == Phase.PHASE_1) {
+            return PHASE1_CAP / PHASE1_ALLOCATION;
+        } else {
+            return PHASE2_CAP / PHASE2_ALLOCATION;
+        }
+    }
+    
+    function getRemainingAllocation() public view returns (uint256) {
+        if (currentPhase == Phase.PHASE_1) {
+            return PHASE1_CAP - totalInvested;
+        } else if (currentPhase == Phase.PHASE_2) {
+            return PHASE2_CAP - (totalInvested - PHASE1_CAP);
+        }
+        return 0;
+    }
+}
